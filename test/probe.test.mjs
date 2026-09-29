@@ -124,7 +124,7 @@ function humanFallback() {
 function baseConfig(extra = {}) {
   return {
     enabled: true,
-    judge: { provider: 'openrouter-jev', model: 'typesafe/jev-router', timeoutMs: 5000, maxTokens: 512, concurrency: 2 },
+    judge: { provider: 'example-provider', model: 'example-model', timeoutMs: 5000, maxTokens: 512, concurrency: 2 },
     auditFile: auditPath(),
     ...extra,
   };
@@ -142,8 +142,8 @@ test('probe: a confident verdict claims the request and the UI never runs', asyn
   assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['permissive'] }] });
   assert.equal(uiCalls.length, 0, 'human popup must not be reached');
   assert.equal(llm.calls.length, 1);
-  assert.equal(llm.calls[0].provider, 'openrouter-jev');
-  assert.equal(llm.calls[0].model, 'typesafe/jev-router');
+  assert.equal(llm.calls[0].provider, 'example-provider');
+  assert.equal(llm.calls[0].model, 'example-model');
   assert.equal(llm.calls[0].maxTokens, 512);
 });
 
