@@ -1,0 +1,11 @@
+# dsh-auto-answer bundle patch.
+#
+# Adds the single host entry that answers `ask_user_question` requests through
+# the `user-questions/request` waterfall. There is no client half: when the
+# plugin declines (free-text question, unsure, error, timeout) it calls next(),
+# so the ordinary browser popup answers exactly as before.
+#
+# Install: dsh plugin --profile <name> add <path to this directory>
+- insert:
+    - id: auto-answer
+      name: dsh-auto-answer
