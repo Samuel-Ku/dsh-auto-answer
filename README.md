@@ -27,11 +27,15 @@ The plugin claims a request only when it can answer **every** question from that
 - any question without `options` — free text needs facts only the operator has (a path, a secret, a personal preference, a business decision);
 - no `judge.provider` / `judge.model` configured, or no `llm` service mounted;
 - a verdict that is not `{"confident": true}`;
-- a reply that is not JSON, or a label that is not one of that question's options;
+- a reply that is not JSON, or a label that names no option of that question;
 - an unanswered question, or the wrong number of picks for a single-select question;
 - timeout, abort, stream error, or concurrency overflow.
 
 There is deliberately **no** "guess anyway" path. An answer invented on the operator's behalf is worse than one extra popup.
+
+### Option labels are matched leniently — but only about formatting
+
+Asking agents decorate labels (`balanced (Recommended)`, `glm-5.3-flash (2x usage)`), and a model that echoes only the stem used to be treated as inventing an option, losing a perfectly answerable question to a popup. `resolveLabel` therefore widens in four stages — exact, whitespace/case-normalized, trailing-parenthetical stripped, then unique prefix in either direction — and **every stage demands a unique hit**. The moment two options could both match, it returns null and the question goes to the human. Tolerance is about formatting only; option *identity* is never guessed.
 
 ## How it hooks in
 
@@ -102,10 +106,23 @@ One JSONL line per request, at `auditFile`:
 
 ```json
 {"time":1790422374944,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","answers":[{"id":"preset","selected":["permissive"]}]}
-{"time":1790422375001,"sessionId":"session-…","questionIds":["key"],"outcome":"delegate","error":"BAD_OUTPUT","message":"reply did not answer every question with valid option labels"}
+{"time":1790422375001,"sessionId":"session-…","questionIds":["key"],"outcome":"delegate","error":"NOT_CONFIDENT","message":"the model judged the excerpt insufficient to answer","reply":"{\"confident\":false}"}
 ```
 
-`outcome` is `answered` or `delegate`; `delegate` carries the `error` code that sent the request to the human (`BAD_OUTPUT`, `TIMEOUT`, `STREAM_ERROR`, `NO_ADAPTER`, `OVERLOAD`).
+`outcome` is `answered` or `delegate`. A delegate always names why:
+
+| `error` | Meaning | Actionable? |
+|---|---|---|
+| `NOT_CONFIDENT` | the model judged the excerpt insufficient | working as designed — give it more context, or answer by hand |
+| `BAD_LABELS` | the reply did not line up with the offered options | worth reading `reply`; usually a model that paraphrased |
+| `BAD_OUTPUT` | the reply was not a JSON object, was empty, or contained a tool call | often a truncated reply — raise `judge.maxTokens` |
+| `TIMEOUT` | the request outlived `judge.timeoutMs` | raise the timeout, or check for a plugin parking `llm/stream` |
+| `STREAM_ERROR` | the provider stream threw | check provider health |
+| `NO_ADAPTER` | no provider/model configured | configure them |
+| `OVERLOAD` | more concurrent questions than `judge.concurrency` | raise it |
+| `ABORTED` | the turn was cancelled while answering | — |
+
+When the model's *own text* caused the failure (`BAD_OUTPUT`, `BAD_LABELS`, `NOT_CONFIDENT`), the entry also carries a `reply` excerpt — otherwise a delegate cannot be explained after the fact.
 
 ## Tests
 
@@ -114,7 +131,7 @@ npm install
 npm test
 ```
 
-30 tests in two layers:
+39 tests in two layers:
 
 - `test/logic.test.mjs` — config normalization, tolerant JSON extraction, the strict option-label validator, transcript building.
 - `test/probe.test.mjs` — mounts the plugin on a **real Cordis context** and drives the actual `user-questions/request` waterfall. It asserts both halves of the contract: a confident verdict claims the request and the human answerer never runs, and every doubtful path delegates to it.

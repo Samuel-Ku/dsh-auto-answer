@@ -251,6 +251,9 @@ test('probe: writes an audit line for both outcomes', async () => {
     fromChunks(textChunks('{"answers":[{"id":"preset","selected":["yolo"]}],"confident":true,"reason":"ок"}')),
   );
   await confident.ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  // Appends are fire-and-forget, so settle the first line before the second run
+  // starts writing: otherwise the two appends can land out of order.
+  await readAuditLines(file, 1);
 
   const doubtful = await boot({ ...baseConfig(), auditFile: file }, () => fromChunks(textChunks('nope')));
   await doubtful.ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
@@ -259,5 +262,36 @@ test('probe: writes an audit line for both outcomes', async () => {
   assert.deepEqual(lines.map((l) => l.outcome), ['answered', 'delegate']);
   assert.equal(lines[1].error, 'BAD_OUTPUT');
   assert.deepEqual(lines[0].answers, [{ id: 'preset', selected: ['yolo'] }]);
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: dropping the "(Recommended)" decoration from a pick still claims the request', async () => {
+  // QUESTIONS offers 'balanced (Recommended)'; a model that echoes only
+  // 'balanced' used to be treated as inventing an option and losing the
+  // request to a popup.
+  const { ctx, uiCalls } = await boot(baseConfig(), () =>
+    fromChunks(textChunks('{"answers":[{"id":"preset","selected":["balanced"]}],"confident":true,"reason":"ок"}')),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['balanced (Recommended)'] }] }, 'canonical label returned');
+  assert.equal(uiCalls.length, 0, 'human popup must not be reached');
+});
+
+test('probe: the audit names the failure and keeps the raw reply', async () => {
+  const file = auditPath();
+  const unsure = await boot({ ...baseConfig(), auditFile: file }, () => fromChunks(textChunks('{"confident":false}')));
+  await unsure.ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  // See the note above: settle each append before the next one is issued.
+  await readAuditLines(file, 1);
+
+  const badLabel = await boot({ ...baseConfig(), auditFile: file }, () =>
+    fromChunks(textChunks('{"answers":[{"id":"preset","selected":["turbo"]}],"confident":true}')),
+  );
+  await badLabel.ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+
+  const lines = await readAuditLines(file, 2);
+  assert.deepEqual(lines.map((l) => l.error), ['NOT_CONFIDENT', 'BAD_LABELS'], 'the two delegates are distinguishable');
+  assert.match(lines[0].reply, /confident/, 'raw reply retained for the unsure case');
+  assert.match(lines[1].reply, /turbo/, 'raw reply retained for the bad-label case');
   fs.rmSync(file, { force: true });
 });

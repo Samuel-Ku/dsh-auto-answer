@@ -1,6 +1,7 @@
 /**
  * Pure-logic tests for dsh-auto-answer: config normalization, tolerant JSON
- * extraction, the strict option-label validator, and transcript building.
+ * extraction, the option-label resolver, the verdict validator, and transcript
+ * building.
  *
  * Run: node --test test/
  */
@@ -11,6 +12,7 @@ import {
   DEFAULT_SYSTEM_PROMPT,
   normalizeConfig,
   parseJsonObject,
+  resolveLabel,
   transcriptOf,
   validateVerdict,
 } from '../lib/index.js';
@@ -178,4 +180,55 @@ test('transcriptOf: survives a missing/odd agent', () => {
   assert.equal(transcriptOf({}, 100), '');
   assert.equal(transcriptOf({ session: {} }, 100), '');
   assert.equal(transcriptOf(fakeAgent([]), 100), '');
+});
+
+/* ----------------------------------------------------------- resolveLabel */
+
+const DECORATED = [
+  'Перевантажити метод і зберегти сумісність (Recommended)',
+  'Змінити сигнатуру й оновити всі виклики',
+  'Винести в окремий метод',
+];
+
+test('resolveLabel: exact and whitespace/case-normalized matches', () => {
+  assert.equal(resolveLabel(DECORATED[1], DECORATED), DECORATED[1]);
+  assert.equal(resolveLabel('  змінити   СИГНАТУРУ й оновити всі виклики ', DECORATED), DECORATED[1]);
+});
+
+test('resolveLabel: a dropped trailing decoration still resolves', () => {
+  assert.equal(resolveLabel('Перевантажити метод і зберегти сумісність', DECORATED), DECORATED[0]);
+  assert.equal(resolveLabel('Перевантажити метод і зберегти сумісність (Рекомендовано)', DECORATED), DECORATED[0]);
+});
+
+test('resolveLabel: a unique prefix in either direction resolves', () => {
+  assert.equal(resolveLabel('Винести в окремий', DECORATED), DECORATED[2], 'pick is a prefix of the label');
+  assert.equal(resolveLabel('Винести в окремий метод, бо так чистіше', DECORATED), DECORATED[2], 'label is a prefix of the pick');
+});
+
+test('resolveLabel: refuses the moment two options could both match', () => {
+  const sameStem = ['Варіант A (Recommended)', 'Варіант A (Alternative)'];
+  assert.equal(resolveLabel('Варіант A (Recommended)', sameStem), 'Варіант A (Recommended)', 'an exact match wins outright');
+  assert.equal(resolveLabel('Варіант A', sameStem), null, 'the bare stem names both options once decorations are stripped');
+  assert.equal(resolveLabel('Варіант', sameStem), null, 'a prefix of both');
+});
+
+test('resolveLabel: a case variant still resolves when only one option fits', () => {
+  const labels = ['Варіант A (Recommended)', 'Варіант B'];
+  assert.equal(resolveLabel('варіант a', labels), 'Варіант A (Recommended)');
+});
+
+test('resolveLabel: refuses a short or foreign pick', () => {
+  assert.equal(resolveLabel('так', DECORATED), null, 'too short to prefix-match safely');
+  assert.equal(resolveLabel('Вигаданий варіант', DECORATED), null);
+  assert.equal(resolveLabel('', DECORATED), null);
+});
+
+test('validateVerdict: uses the tolerant resolver but still needs a real option', () => {
+  const qs = [{ id: 'q', question: 'Що робити?', options: DECORATED.map((label) => ({ label })) }];
+  const ok = validateVerdict({ answers: [{ id: 'q', selected: ['Винести в окремий метод'] }], confident: true }, qs);
+  assert.deepEqual(ok.answers[0].selected, [DECORATED[2]], 'canonical label returned');
+  assert.equal(
+    validateVerdict({ answers: [{ id: 'q', selected: ['Щось інше'] }], confident: true }, qs),
+    null,
+  );
 });
