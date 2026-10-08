@@ -53,6 +53,17 @@ async function* fromChunks(chunks) {
 }
 
 /**
+ * Fake producer that walks a script of replies, one per model call, holding the
+ * last one once the script runs out.
+ * @param {string[]} replies replies in call order
+ * @returns {Function} FakeLlm producer
+ */
+function scripted(replies) {
+  let call = 0;
+  return () => fromChunks(textChunks(replies[Math.min(call++, replies.length - 1)]));
+}
+
+/**
  * Read the audit trail once it holds at least `atLeast` complete lines.
  *
  * The plugin appends fire-and-forget, so a fixed sleep can read a half-written
@@ -239,6 +250,100 @@ test('probe: delegates when disabled by config', async () => {
   assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
   assert.equal(uiCalls.length, 1);
   assert.equal(llm.calls.length, 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * repair pass
+ * ------------------------------------------------------------------ */
+
+const GOOD = '{"answers":[{"id":"preset","selected":["permissive"]}],"confident":true,"reason":"ок"}';
+
+test('probe: a malformed first reply is repaired and the request is still claimed', async () => {
+  const file = auditPath();
+  const { ctx, llm, uiCalls } = await boot(
+    { ...baseConfig(), auditFile: file },
+    scripted(['I think permissive is best.', GOOD]),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['permissive'] }] });
+  assert.equal(uiCalls.length, 0, 'human popup must not be reached');
+  assert.equal(llm.calls.length, 2, 'exactly one repair turn');
+  const lines = await readAuditLines(file, 1);
+  assert.equal(lines[0].outcome, 'answered');
+  assert.equal(lines[0].repairs.length, 1, 'the answered line still shows the rejected reply');
+  assert.equal(lines[0].repairs[0].error, 'BAD_OUTPUT');
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: the repair turn quotes the rejected reply and restates the contract', async () => {
+  // The conversation array is reused across attempts, so record its length from
+  // inside the producer: after the repair it is no longer 1 for the first call.
+  const lengths = [];
+  const { ctx, llm } = await boot(baseConfig(), (options) => {
+    lengths.push(options.messages.length);
+    return fromChunks(textChunks(lengths.length === 1 ? 'two' : GOOD));
+  });
+  await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(lengths, [1, 2], 'the first call carries the questions alone; the repair extends that conversation');
+  const repair = llm.calls[1].messages[1].content[0].text;
+  assert.match(repair, /previous reply was rejected/i);
+  assert.match(repair, /two/, 'the rejected reply is quoted back');
+  assert.match(repair, /"answers"/, 'the output contract is restated');
+});
+
+test('probe: a reply with invented labels is repaired', async () => {
+  const { ctx, llm, uiCalls } = await boot(
+    baseConfig(),
+    scripted(['{"answers":[{"id":"preset","selected":["turbo"]}],"confident":true}', '{"answers":[{"id":"preset","selected":["balanced"]}],"confident":true,"reason":"ок"}']),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['balanced (Recommended)'] }] }, 'canonical label returned');
+  assert.equal(uiCalls.length, 0, 'human popup must not be reached');
+  assert.equal(llm.calls.length, 2);
+});
+
+test('probe: gives up after the configured repair attempt', async () => {
+  const file = auditPath();
+  const { ctx, llm, uiCalls } = await boot({ ...baseConfig(), auditFile: file }, () => fromChunks(textChunks('still not json')));
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
+  assert.equal(uiCalls.length, 1, 'the popup answers once the repairs are spent');
+  assert.equal(llm.calls.length, 2, 'one attempt plus one repair, never more');
+  const lines = await readAuditLines(file, 1);
+  assert.equal(lines[0].outcome, 'delegate');
+  assert.equal(lines[0].error, 'BAD_OUTPUT');
+  assert.equal(lines[0].repairs.length, 1);
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: repairAttempts buys exactly that many extra turns', async () => {
+  const { ctx, llm, uiCalls } = await boot(
+    { ...baseConfig(), judge: { ...baseConfig().judge, repairAttempts: 3 } },
+    scripted(['nope', 'still nope', 'not json either', GOOD]),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['permissive'] }] });
+  assert.equal(uiCalls.length, 0);
+  assert.equal(llm.calls.length, 4, 'three repairs after the first attempt');
+});
+
+test('probe: repairAttempts: 0 disables the repair pass', async () => {
+  const { ctx, llm, uiCalls } = await boot(
+    { ...baseConfig(), judge: { ...baseConfig().judge, repairAttempts: 0 } },
+    scripted(['nope', GOOD]),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
+  assert.equal(uiCalls.length, 1);
+  assert.equal(llm.calls.length, 1, 'the scripted second reply is never asked for');
+});
+
+test('probe: an unsure verdict is never repaired', async () => {
+  const { ctx, llm, uiCalls } = await boot(baseConfig(), scripted(['{"confident":false}', GOOD]));
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
+  assert.equal(uiCalls.length, 1);
+  assert.equal(llm.calls.length, 1, 'repeating the question cannot change "not confident"');
 });
 
 /* ------------------------------------------------------------------ *

@@ -36,7 +36,16 @@ test('normalizeConfig: defaults are inert-but-sane', () => {
   assert.equal(c.judge.timeoutMs, 60000);
   assert.equal(c.judge.maxTokens, 4096);
   assert.equal(c.judge.concurrency, 2);
+  assert.equal(c.judge.repairAttempts, 1, 'one repair turn by default');
   assert.match(c.auditFile, /auto-answer\.jsonl$/);
+});
+
+test('normalizeConfig: repairAttempts accepts zero but nothing below it', () => {
+  assert.equal(normalizeConfig({}).judge.repairAttempts, 1);
+  assert.equal(normalizeConfig({ judge: { repairAttempts: 0 } }).judge.repairAttempts, 0, '0 is the off switch');
+  assert.equal(normalizeConfig({ judge: { repairAttempts: -1 } }).judge.repairAttempts, 1);
+  assert.equal(normalizeConfig({ judge: { repairAttempts: 2.5 } }).judge.repairAttempts, 1);
+  assert.equal(normalizeConfig({ judge: { repairAttempts: '3' } }).judge.repairAttempts, 1);
 });
 
 test('normalizeConfig: garbage degrades to defaults, never throws', () => {
