@@ -5,7 +5,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![node: >=20](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
 
-When an agent calls `ask_user_question`, DSH pauses the turn and shows a popup. This plugin steps in front of that popup and picks an option itself — but only when it is confident, and only for questions that actually offer options. Everything else falls through to the normal popup, unchanged.
+When an agent calls `ask_user_question`, DSH pauses the turn and shows a popup. This plugin steps in front of that popup and picks an option itself — but only when it is confident, only for questions that actually offer options, and only after a malformed or mislabelled first reply has had its repair turn. Everything else falls through to the normal popup, unchanged.
 
 ## Why this is not `dsh-yolo-mode`
 
@@ -32,6 +32,16 @@ The plugin claims a request only when it can answer **every** question from that
 - timeout, abort, stream error, or concurrency overflow.
 
 There is deliberately **no** "guess anyway" path. An answer invented on the operator's behalf is worse than one extra popup.
+
+### A malformed reply gets one repair turn
+
+The first reply is not always the final word: a model that narrates instead of
+emitting JSON, or paraphrases a label, is told what it did wrong and asked again
+with the rejected reply quoted back. `judge.repairAttempts` (default `1`, `0`
+disables) bounds those extra turns, and they share the request's single deadline
+— a repair can never extend the wait past `judge.timeoutMs`. A request that
+exhausts its repairs fails with the last error, exactly as before. The audit line
+records every rejected reply under `repairs`.
 
 ### Option labels are matched leniently — but only about formatting
 
@@ -70,6 +80,7 @@ All fields are optional. Set them as the plugin row `config`:
 | `judge.maxTokens` | `number` | `4096` | output budget (reasoning models want headroom) |
 | `judge.concurrency` | `number` | `2` | in-flight answers; overflow delegates |
 | `judge.contextChars` | `number` | `6000` | transcript budget sent to the model |
+| `judge.repairAttempts` | `number` | `1` | extra turns for a malformed or mislabelled reply before delegating; `0` = never repair |
 | `auditFile` | `string` | `~/.dsh/logs/auto-answer.jsonl` | JSONL trail |
 
 Example:
@@ -85,6 +96,7 @@ Example:
       timeoutMs: 60000
       maxTokens: 4096
       contextChars: 6000
+      repairAttempts: 1
     auditFile: /home/me/.dsh/logs/auto-answer.jsonl
 ```
 
@@ -98,7 +110,10 @@ The bundle's `cordis.patch.yml` inserts the `auto-answer` entry; override its `c
 
 For a path or `link:` install, keep the checkout under `$DSH_HOME/profiles/` so Node resolves the `@deepseek-ai/*` peers from `$DSH_HOME/profiles/node_modules`.
 
-A **new** plugin module only mounts on a DSH restart; afterwards config edits reload live under `patchReload: live`.
+A **new** plugin module only mounts on a DSH restart — and so does **updated
+plugin code**. `patchReload: live` re-applies `config`; it does not re-import a
+module the host already holds in memory, so a pull that changes `lib/` keeps
+running the old code until dsh restarts. Config edits reload live.
 
 ## Audit trail
 
@@ -107,15 +122,19 @@ One JSONL line per request, at `auditFile`:
 ```json
 {"time":1790422374944,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","answers":[{"id":"preset","selected":["permissive"]}]}
 {"time":1790422375001,"sessionId":"session-…","questionIds":["key"],"outcome":"delegate","error":"NOT_CONFIDENT","message":"the model judged the excerpt insufficient to answer","reply":"{\"confident\":false}"}
+{"time":1790422375100,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","answers":[{"id":"preset","selected":["balanced (Recommended)"]}],"repairs":[{"attempt":1,"error":"BAD_OUTPUT","message":"reply was not a JSON object","reply":"I think balanced is best."}]}
 ```
+
+`repairs` appears only when a reply was rejected and retried; it carries the same
+`error` / `message` / `reply` shape as a delegate.
 
 `outcome` is `answered` or `delegate`. A delegate always names why:
 
 | `error` | Meaning | Actionable? |
 |---|---|---|
 | `NOT_CONFIDENT` | the model judged the excerpt insufficient | working as designed — give it more context, or answer by hand |
-| `BAD_LABELS` | the reply did not line up with the offered options | worth reading `reply`; usually a model that paraphrased |
-| `BAD_OUTPUT` | the reply was not a JSON object, was empty, or contained a tool call | often a truncated reply — raise `judge.maxTokens` |
+| `BAD_LABELS` | the reply did not line up with the offered options, after the repair turn | worth reading `reply`; usually a model that paraphrased |
+| `BAD_OUTPUT` | the reply was not a JSON object, was empty, or contained a tool call, after the repair turn | often a truncated reply — raise `judge.maxTokens` |
 | `TIMEOUT` | the request outlived `judge.timeoutMs` | raise the timeout, or check for a plugin parking `llm/stream` |
 | `STREAM_ERROR` | the provider stream threw | check provider health |
 | `NO_ADAPTER` | no provider/model configured | configure them |
@@ -131,10 +150,10 @@ npm install
 npm test
 ```
 
-39 tests in two layers:
+47 tests in two layers:
 
 - `test/logic.test.mjs` — config normalization, tolerant JSON extraction, the strict option-label validator, transcript building.
-- `test/probe.test.mjs` — mounts the plugin on a **real Cordis context** and drives the actual `user-questions/request` waterfall. It asserts both halves of the contract: a confident verdict claims the request and the human answerer never runs, and every doubtful path delegates to it.
+- `test/probe.test.mjs` — mounts the plugin on a **real Cordis context** and drives the actual `user-questions/request` waterfall. It asserts both halves of the contract: a confident verdict claims the request and the human answerer never runs, and every doubtful path delegates to it. Seven of them cover the repair pass: a malformed reply and a mislabelled one being rescued, the repair turn's own content, the attempt budget running out, `repairAttempts: 0`, and `NOT_CONFIDENT` never being retried.
 
 The `devDependencies` exist only so the tests run from a bare clone; at runtime the plugin resolves its `@deepseek-ai` peers from the DSH install. The suite is verified against both `0.1.5-rc.2` (the version shipped inside DSH 0.1.5) and the published `0.1.7-rc.2` peers.
 
