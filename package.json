@@ -36,8 +36,8 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1",
-    "@deepseek-ai/dsh-timeout": "^0.1.5-rc.1"
+    "@deepseek-ai/dsh-llm": ">=0.1.5-rc.1 <0.3",
+    "@deepseek-ai/dsh-timeout": ">=0.1.5-rc.1 <0.3"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
@@ -51,7 +51,8 @@
     "compatibility": {
       "dshReleases": {
         "0.1.5-rc.1": "compatible",
-        "0.1.5-rc.2": "compatible"
+        "0.1.5-rc.2": "compatible",
+        "0.2.0-rc.2": "compatible"
       },
       "node": ">=20"
     }
