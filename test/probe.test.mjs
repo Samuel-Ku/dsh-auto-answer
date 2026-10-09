@@ -270,8 +270,8 @@ test('probe: a malformed first reply is repaired and the request is still claime
   assert.equal(llm.calls.length, 2, 'exactly one repair turn');
   const lines = await readAuditLines(file, 1);
   assert.equal(lines[0].outcome, 'answered');
-  assert.equal(lines[0].repairs.length, 1, 'the answered line still shows the rejected reply');
-  assert.equal(lines[0].repairs[0].error, 'BAD_OUTPUT');
+  assert.equal(lines[0].trace.length, 1, 'the answered line still shows the rejected reply');
+  assert.equal(lines[0].trace[0].error, 'BAD_OUTPUT');
   fs.rmSync(file, { force: true });
 });
 
@@ -312,7 +312,7 @@ test('probe: gives up after the configured repair attempt', async () => {
   const lines = await readAuditLines(file, 1);
   assert.equal(lines[0].outcome, 'delegate');
   assert.equal(lines[0].error, 'BAD_OUTPUT');
-  assert.equal(lines[0].repairs.length, 1);
+  assert.equal(lines[0].trace.length, 1);
   fs.rmSync(file, { force: true });
 });
 
@@ -344,6 +344,140 @@ test('probe: an unsure verdict is never repaired', async () => {
   assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
   assert.equal(uiCalls.length, 1);
   assert.equal(llm.calls.length, 1, 'repeating the question cannot change "not confident"');
+});
+
+/* ------------------------------------------------------------------ *
+ * second opinion (escalation)
+ * ------------------------------------------------------------------ */
+
+/** Never-answering operator: the popup is open, the human is asleep. */
+function asleepOperator() {
+  return new Promise(() => {});
+}
+
+function escalationConfig(extra = {}) {
+  return {
+    ...baseConfig(),
+    escalation: { provider: 'big-provider', model: 'big-model', timeoutMs: 5000, maxTokens: 512, contextChars: 24000 },
+    ...extra,
+  };
+}
+
+test('probe: a second opinion claims a question the first judge was unsure about', async () => {
+  const file = auditPath();
+  const { ctx, llm, uiCalls } = await boot(
+    escalationConfig({ auditFile: file }),
+    scripted(['{"confident":false}', '{"answers":[{"id":"preset","selected":["balanced"]}],"confident":true,"reason":"ок"}']),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['balanced (Recommended)'] }] });
+  assert.equal(uiCalls.length, 0, 'the operator is never bothered');
+  assert.equal(llm.calls.length, 2);
+  assert.equal(llm.calls[1].provider, 'big-provider', 'the second call goes to the escalation profile');
+  assert.equal(llm.calls[1].model, 'big-model');
+  const lines = await readAuditLines(file, 1);
+  assert.equal(lines[0].outcome, 'answered');
+  assert.equal(lines[0].via, 'escalation');
+  assert.equal(lines[0].trace.length, 1, 'the unsure verdict is on record');
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: the second opinion sees more of the conversation', async () => {
+  // Twenty short messages: the primary budget (6000) fits about six, the
+  // escalation budget (24000) fits all of them.
+  const agent = {
+    session: {
+      id: 'session-big',
+      events: Array.from({ length: 20 }, (_, i) => ({
+        type: 'user/message',
+        data: { content: `m${i}-${'x'.repeat(1000)}` },
+      })),
+    },
+  };
+  const { ctx, llm } = await boot(escalationConfig(), scripted(['{"confident":false}', '{"answers":[{"id":"preset","selected":["yolo"]}],"confident":true,"reason":"ок"}']));
+  await ctx.waterfall('user-questions/request', request(QUESTIONS, agent), humanFallback);
+  const first = JSON.parse(llm.calls[0].messages[0].content[0].text).conversationExcerpt;
+  const second = JSON.parse(llm.calls[1].messages[0].content[0].text).conversationExcerpt;
+  assert.ok(second.length > first.length, `escalation excerpt (${second.length}) must exceed the primary one (${first.length})`);
+});
+
+test('probe: a still-unsure second opinion falls through to the operator', async () => {
+  const { ctx, llm, uiCalls } = await boot(
+    escalationConfig(),
+    scripted(['{"confident":false}', '{"confident":false}']),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
+  assert.equal(uiCalls.length, 1);
+  assert.equal(llm.calls.length, 2);
+});
+
+/* ------------------------------------------------------------------ *
+ * bounded wait (fallback)
+ * ------------------------------------------------------------------ */
+
+test('probe: the wait for the operator is bounded and the fallback answers', async () => {
+  const file = auditPath();
+  const { ctx, llm, uiCalls } = await boot(
+    escalationConfig({ auditFile: file, fallback: { afterMs: 60 } }),
+    scripted([
+      '{"confident":false}',
+      '{"confident":false}',
+      '{"answers":[{"id":"preset","selected":["yolo"]}],"confident":true,"reason":"вимушений вибір"}',
+    ]),
+  );
+  const started = Date.now();
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), asleepOperator);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['yolo'] }] }, 'the fallback answered');
+  assert.ok(Date.now() - started < 5000, 'the call returned once the window closed');
+  assert.equal(uiCalls.length, 1, 'the popup was still opened for the operator');
+  assert.equal(llm.calls.length, 3, 'unsure, unsure again, then the forced pick');
+  assert.match(llm.calls[2].system, /unreachable/i, 'the forced call carries the forced suffix');
+  const lines = await readAuditLines(file, 1);
+  assert.equal(lines[0].outcome, 'answered');
+  assert.equal(lines[0].via, 'fallback-escalation');
+  assert.equal(lines[0].fallback.afterMs, 60);
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: when no model can force a pick, the (Recommended) option is taken', async () => {
+  const file = auditPath();
+  const { ctx } = await boot({ ...baseConfig(), auditFile: file, fallback: { afterMs: 50 } }, () => fromChunks(textChunks('not json')));
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), asleepOperator);
+  assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['balanced (Recommended)'] }] });
+  const lines = await readAuditLines(file, 1);
+  assert.equal(lines[0].via, 'fallback-recommended');
+  assert.equal(lines[0].fallback.afterMs, 50);
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: a prompt operator answer is never overridden', async () => {
+  const file = auditPath();
+  const { ctx, llm } = await boot(
+    escalationConfig({ auditFile: file, fallback: { afterMs: 30000 } }),
+    () => fromChunks(textChunks('not json')),
+  );
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), humanFallback);
+  assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] });
+  assert.equal(llm.calls.length, 2, 'no forced call once the operator answered');
+  const lines = await readAuditLines(file, 1);
+  assert.equal(lines[0].outcome, 'delegate');
+  assert.equal(lines[0].via, undefined, 'nothing claimed it');
+  fs.rmSync(file, { force: true });
+});
+
+test('probe: fallback.afterMs: 0 keeps the unbounded wait', async () => {
+  const { ctx, llm } = await boot(
+    escalationConfig({ fallback: { afterMs: 0 } }),
+    () => fromChunks(textChunks('not json')),
+  );
+  const late = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    return humanFallback();
+  };
+  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), late);
+  assert.deepEqual(result, { answers: [{ id: 'human', selected: ['answered-by-human'] }] }, 'the late human answer still wins');
+  assert.equal(llm.calls.length, 2, 'the two judge calls and nothing else');
 });
 
 /* ------------------------------------------------------------------ *

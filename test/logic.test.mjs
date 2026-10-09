@@ -9,9 +9,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  DEFAULT_ESCALATION_PROMPT,
   DEFAULT_SYSTEM_PROMPT,
   normalizeConfig,
   parseJsonObject,
+  pickObvious,
   resolveLabel,
   transcriptOf,
   validateVerdict,
@@ -71,6 +73,24 @@ test('normalizeConfig: explicit values win', () => {
   assert.equal(c.judge.concurrency, 4);
   assert.equal(c.judge.contextChars, 100);
   assert.equal(c.auditFile, '/tmp/x.jsonl');
+});
+
+test('normalizeConfig: escalation and fallback defaults', () => {
+  const c = normalizeConfig({});
+  assert.equal(c.judge.maxMessageChars, 1200);
+  assert.equal(c.escalation.provider, '');
+  assert.equal(c.escalation.model, '');
+  assert.equal(c.escalation.systemPrompt, DEFAULT_ESCALATION_PROMPT);
+  assert.equal(c.escalation.contextChars, 24000, 'the second opinion gets four times the primary budget');
+  assert.equal(c.escalation.timeoutMs, 120000);
+  assert.equal(c.fallback.afterMs, 600000, 'ten minutes by default');
+  assert.equal(c.fallback.allowRecommended, true);
+
+  assert.equal(normalizeConfig({ fallback: { afterMs: 0 } }).fallback.afterMs, 0, '0 is the off switch');
+  assert.equal(normalizeConfig({ fallback: { afterMs: -5 } }).fallback.afterMs, 600000);
+  assert.equal(normalizeConfig({ fallback: { allowRecommended: false } }).fallback.allowRecommended, false);
+  assert.equal(normalizeConfig({ escalation: { contextChars: -1 } }).escalation.contextChars, 24000);
+  assert.equal(normalizeConfig({ escalation: { systemPrompt: '  ' } }).escalation.systemPrompt, DEFAULT_ESCALATION_PROMPT);
 });
 
 /* ------------------------------------------------------- parseJsonObject */
@@ -189,6 +209,56 @@ test('transcriptOf: survives a missing/odd agent', () => {
   assert.equal(transcriptOf({}, 100), '');
   assert.equal(transcriptOf({ session: {} }, 100), '');
   assert.equal(transcriptOf(fakeAgent([]), 100), '');
+});
+
+test('transcriptOf: operator words stay apart from relayed agent reports', () => {
+  const agent = fakeAgent([
+    { type: 'user/message', data: { source: { kind: 'agent-message', senderSessionId: 'x' }, content: `REPORT: ${'r'.repeat(200)}` } },
+    { type: 'user/message', data: { source: { kind: 'subagent-settled', senderSessionId: 'x' }, content: 'settled notice' } },
+    { type: 'user/message', data: { source: { kind: 'skill-catalog' }, content: 'CATALOG NOISE' } },
+    { type: 'user/message', data: { source: { kind: 'runtime-context' }, content: 'SNAPSHOT NOISE' } },
+    { type: 'user/message', data: { source: { kind: 'agent-instructions' }, content: 'INSTRUCTIONS' } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: 'спершу закрий тікети' } },
+  ]);
+  const out = transcriptOf(agent, 6000);
+  assert.match(out, /\[operator\] спершу закрий тікети/, 'the operator is the operator');
+  assert.match(out, /\[agent-report\] REPORT/, 'a relayed report is labelled as one');
+  assert.match(out, /\[agent-notice\] settled notice/);
+  for (const noise of ['CATALOG NOISE', 'SNAPSHOT NOISE', 'INSTRUCTIONS']) {
+    assert.ok(!out.includes(noise), `${noise} must not reach the judge`);
+  }
+});
+
+test('transcriptOf: one long report cannot crowd out the rest', () => {
+  const events = [{ type: 'user/message', data: { content: 'x'.repeat(9000) } }];
+  for (let i = 0; i < 5; i++) events.push({ type: 'user/message', data: { content: `short-${i}` } });
+  const out = transcriptOf(fakeAgent(events), 6000, 200);
+  assert.ok(out.includes('short-4'), 'the newest short messages survive the cap');
+  assert.ok(out.includes('[+8800 chars]'), 'the long one is capped, not dropped');
+  assert.ok(out.length < 2000, 'the excerpt stays small');
+});
+
+/* ----------------------------------------------------------- pickObvious */
+
+test('pickObvious: takes the single (Recommended) option, refuses a real choice', () => {
+  const one = [{ id: 'a', options: [{ label: 'one' }, { label: 'two (Recommended)' }] }];
+  assert.deepEqual(pickObvious(one), { answers: [{ id: 'a', selected: ['two (Recommended)'] }] });
+  assert.deepEqual(
+    pickObvious([{ id: 'a', options: [{ label: 'єдиний' }] }]),
+    { answers: [{ id: 'a', selected: ['єдиний'] }] },
+    'a one-option question is not a choice',
+  );
+  assert.equal(pickObvious([{ id: 'a', options: [{ label: 'one' }, { label: 'two' }] }]), null, 'a real choice is not guessed');
+  assert.equal(
+    pickObvious([{ id: 'a', options: [{ label: 'x (Recommended)' }, { label: 'y (Recommended)' }] }]),
+    null,
+    'two recommendations are no recommendation',
+  );
+  assert.equal(
+    pickObvious([{ id: 'ok', options: [{ label: 'x (Recommended)' }, { label: 'y' }] }, { id: 'no', options: [{ label: 'a' }, { label: 'b' }] }]),
+    null,
+    'every question must be answerable',
+  );
 });
 
 /* ----------------------------------------------------------- resolveLabel */
