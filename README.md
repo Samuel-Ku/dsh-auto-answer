@@ -40,8 +40,9 @@ A `NOT_CONFIDENT` verdict from the primary judge is not the end of the road. The
 budget — is asked the same questions with one instruction the primary lacks: the
 first judge already refused, so this one is told to commit. Its built-in prompt
 states what outranks what (the operator's own words above every agent report,
-this project's written decisions above improvisation, reversibility as the
-tie-breaker), which is what turns "not confident" into a defensible answer.
+this project's written decisions and its SDLC above improvisation, reversibility
+as the tie-breaker), which is what turns "not confident" into a defensible
+answer.
 
 ### The wait for the operator is bounded
 
