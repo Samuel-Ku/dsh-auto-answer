@@ -5,7 +5,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![node: >=20](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
 
-When an agent calls `ask_user_question`, DSH pauses the turn and shows a popup. This plugin steps in front of that popup and picks an option itself — but only when it is confident, only for questions that actually offer options, and only after a malformed or mislabelled first reply has had its repair turn. Everything else falls through to the normal popup, unchanged.
+When an agent calls `ask_user_question`, DSH pauses the turn and shows a popup. This plugin steps in front of that popup and picks an option itself — but only when it is confident, only for questions that actually offer options, and only after a malformed or mislabelled first reply has had its repair turn. When it still cannot settle the question, a second-opinion model with more of the conversation gets a try, and only then does the popup appear — where the wait is bounded by `fallback.afterMs` instead of lasting until you wake up.
 
 ## Why this is not `dsh-yolo-mode`
 
@@ -32,6 +32,26 @@ The plugin claims a request only when it can answer **every** question from that
 - timeout, abort, stream error, or concurrency overflow.
 
 There is deliberately **no** "guess anyway" path. An answer invented on the operator's behalf is worse than one extra popup.
+
+### A second opinion before the operator is bothered
+
+A `NOT_CONFIDENT` verdict from the primary judge is not the end of the road. The
+`escalation.*` profile — typically a bigger model given four times the transcript
+budget — is asked the same questions with one instruction the primary lacks: the
+first judge already refused, so this one is told to commit. Its built-in prompt
+states what outranks what (the operator's own words above every agent report,
+this project's written decisions above improvisation, reversibility as the
+tie-breaker), which is what turns "not confident" into a defensible answer.
+
+### The wait for the operator is bounded
+
+Once a question is genuinely the operator's, the popup opens — but the plugin
+races it against `fallback.afterMs` (default 10 minutes, `0` disables). On
+timeout it asks the escalation profile to choose *now*; if that fails too, it
+takes the single option marked `(Recommended)`, or the only option there is. A
+question that offers a real choice and defeats both judges keeps waiting, and the
+audit line says so. Without this, one unanswered popup stopped a session for
+15 hours.
 
 ### A malformed reply gets one repair turn
 
@@ -80,7 +100,16 @@ All fields are optional. Set them as the plugin row `config`:
 | `judge.maxTokens` | `number` | `4096` | output budget (reasoning models want headroom) |
 | `judge.concurrency` | `number` | `2` | in-flight answers; overflow delegates |
 | `judge.contextChars` | `number` | `6000` | transcript budget sent to the model |
+| `judge.maxMessageChars` | `number` | `1200` | per-message cap, so one long report cannot crowd out the rest |
 | `judge.repairAttempts` | `number` | `1` | extra turns for a malformed or mislabelled reply before delegating; `0` = never repair |
+| `escalation.provider` | `string` | `''` | second-opinion provider; empty disables the second opinion |
+| `escalation.model` | `string` | `''` | second-opinion model id |
+| `escalation.systemPrompt` | `string` | built-in | override the second-opinion prompt |
+| `escalation.timeoutMs` | `number` | `120000` | per-call deadline of the second opinion (its own, not shared) |
+| `escalation.maxTokens` | `number` | `8192` | output budget of the second opinion |
+| `escalation.contextChars` | `number` | `24000` | transcript budget of the second opinion |
+| `fallback.afterMs` | `number` | `600000` | how long the popup may block before the fallback answers; `0` = wait for ever |
+| `fallback.allowRecommended` | `boolean` | `true` | allow the last-resort `(Recommended)` pick when no model can decide |
 | `auditFile` | `string` | `~/.dsh/logs/auto-answer.jsonl` | JSONL trail |
 
 Example:
@@ -92,11 +121,21 @@ Example:
     enabled: true
     judge:
       provider: my-provider
-      model: my-model
+      model: my-fast-model
       timeoutMs: 60000
       maxTokens: 4096
       contextChars: 6000
+      maxMessageChars: 1200
       repairAttempts: 1
+    escalation:
+      provider: my-provider
+      model: my-big-model
+      contextChars: 24000
+      maxTokens: 8192
+      timeoutMs: 120000
+    fallback:
+      afterMs: 600000
+      allowRecommended: true
     auditFile: /home/me/.dsh/logs/auto-answer.jsonl
 ```
 
@@ -120,19 +159,24 @@ running the old code until dsh restarts. Config edits reload live.
 One JSONL line per request, at `auditFile`:
 
 ```json
-{"time":1790422374944,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","answers":[{"id":"preset","selected":["permissive"]}]}
+{"time":1790422374944,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","via":"judge","answers":[{"id":"preset","selected":["permissive"]}]}
 {"time":1790422375001,"sessionId":"session-…","questionIds":["key"],"outcome":"delegate","error":"NOT_CONFIDENT","message":"the model judged the excerpt insufficient to answer","reply":"{\"confident\":false}"}
-{"time":1790422375100,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","answers":[{"id":"preset","selected":["balanced (Recommended)"]}],"repairs":[{"attempt":1,"error":"BAD_OUTPUT","message":"reply was not a JSON object","reply":"I think balanced is best."}]}
+{"time":1790422375100,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","via":"escalation","answers":[{"id":"preset","selected":["balanced (Recommended)"]}],"trace":[{"attempt":"escalation","error":"NOT_CONFIDENT","message":"the model judged the excerpt insufficient to answer","reply":"{\"confident\":false}"}]}
+{"time":1790422375200,"sessionId":"session-…","questionIds":["preset"],"outcome":"answered","via":"fallback-escalation","answers":[{"id":"preset","selected":["yolo"]}],"fallback":{"afterMs":600000}}
 ```
 
-`repairs` appears only when a reply was rejected and retried; it carries the same
-`error` / `message` / `reply` shape as a delegate.
+`via` names what actually decided: `judge`, `escalation`, `fallback-escalation`,
+`fallback-judge`, or `fallback-recommended`. `trace` appears only when a reply was
+rejected, repaired or escalated — it carries the same `error` / `message` /
+`reply` shape as a delegate, plus `attempt: "escalation"` for the hand-off.
+`fallback` records that the operator did not answer in time, and
+`fallback.forcedError` explains a fallback that had to fall back further.
 
 `outcome` is `answered` or `delegate`. A delegate always names why:
 
 | `error` | Meaning | Actionable? |
 |---|---|---|
-| `NOT_CONFIDENT` | the model judged the excerpt insufficient | working as designed — give it more context, or answer by hand |
+| `NOT_CONFIDENT` | the model judged the excerpt insufficient — and the second opinion agreed, or none is configured | working as designed — give it more context, point `escalation.*` at a bigger model, or answer by hand |
 | `BAD_LABELS` | the reply did not line up with the offered options, after the repair turn | worth reading `reply`; usually a model that paraphrased |
 | `BAD_OUTPUT` | the reply was not a JSON object, was empty, or contained a tool call, after the repair turn | often a truncated reply — raise `judge.maxTokens` |
 | `TIMEOUT` | the request outlived `judge.timeoutMs` | raise the timeout, or check for a plugin parking `llm/stream` |
@@ -150,10 +194,10 @@ npm install
 npm test
 ```
 
-47 tests in two layers:
+58 tests in two layers:
 
-- `test/logic.test.mjs` — config normalization, tolerant JSON extraction, the strict option-label validator, transcript building.
-- `test/probe.test.mjs` — mounts the plugin on a **real Cordis context** and drives the actual `user-questions/request` waterfall. It asserts both halves of the contract: a confident verdict claims the request and the human answerer never runs, and every doubtful path delegates to it. Seven of them cover the repair pass: a malformed reply and a mislabelled one being rescued, the repair turn's own content, the attempt budget running out, `repairAttempts: 0`, and `NOT_CONFIDENT` never being retried.
+- `test/logic.test.mjs` — config normalization (including `escalation.*` and `fallback.*`), tolerant JSON extraction, the strict option-label validator, transcript classification and capping, the `(Recommended)` last resort, transcript building.
+- `test/probe.test.mjs` — mounts the plugin on a **real Cordis context** and drives the actual `user-questions/request` waterfall. It asserts both halves of the contract: a confident verdict claims the request and the human answerer never runs, and every doubtful path delegates to it. Eleven of them cover the newer paths: the repair pass, the second opinion claiming an unsure question with a bigger excerpt, a still-unsure second opinion falling through, the bounded wait answering while the popup stays open, the `(Recommended)` last resort, a prompt operator answer never being overridden, and `fallback.afterMs: 0` keeping the old unbounded wait.
 
 The `devDependencies` exist only so the tests run from a bare clone; at runtime the plugin resolves its `@deepseek-ai` peers from the DSH install. The suite is verified against both `0.1.5-rc.2` (the version shipped inside DSH 0.1.5) and the published `0.1.7-rc.2` peers.
 
