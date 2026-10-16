@@ -416,6 +416,23 @@ test('probe: a still-unsure second opinion falls through to the operator', async
  * bounded wait (fallback)
  * ------------------------------------------------------------------ */
 
+/**
+ * The plugin unref's its fallback timer on purpose, so that a bounded wait is
+ * never what keeps a real session alive. A test that waits for that timer is
+ * therefore left with nothing ref'd, and the runner on Node 20 and 22 cancels
+ * the pending promise ("Promise resolution is still pending but the event loop
+ * has already resolved") instead of letting the timer fire. Hold a ref'd handle
+ * across the await so the unref'd timer still gets its turn.
+ */
+async function whileWaitingForTheTimer(fn) {
+  const handle = setInterval(() => {}, 20);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(handle);
+  }
+}
+
 test('probe: the wait for the operator is bounded and the fallback answers', async () => {
   const file = auditPath();
   const { ctx, llm, uiCalls } = await boot(
@@ -427,7 +444,8 @@ test('probe: the wait for the operator is bounded and the fallback answers', asy
     ]),
   );
   const started = Date.now();
-  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), asleepOperator);
+  const result = await whileWaitingForTheTimer(() =>
+    ctx.waterfall('user-questions/request', request(QUESTIONS), asleepOperator));
   assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['yolo'] }] }, 'the fallback answered');
   assert.ok(Date.now() - started < 5000, 'the call returned once the window closed');
   assert.equal(uiCalls.length, 1, 'the popup was still opened for the operator');
@@ -443,7 +461,8 @@ test('probe: the wait for the operator is bounded and the fallback answers', asy
 test('probe: when no model can force a pick, the (Recommended) option is taken', async () => {
   const file = auditPath();
   const { ctx } = await boot({ ...baseConfig(), auditFile: file, fallback: { afterMs: 50 } }, () => fromChunks(textChunks('not json')));
-  const result = await ctx.waterfall('user-questions/request', request(QUESTIONS), asleepOperator);
+  const result = await whileWaitingForTheTimer(() =>
+    ctx.waterfall('user-questions/request', request(QUESTIONS), asleepOperator));
   assert.deepEqual(result, { answers: [{ id: 'preset', selected: ['balanced (Recommended)'] }] });
   const lines = await readAuditLines(file, 1);
   assert.equal(lines[0].via, 'fallback-recommended');
